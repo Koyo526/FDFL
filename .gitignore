@@ -1,0 +1,126 @@
+# 画像ファイル
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.tif
+*.ico
+*.svg
+*.webp
+
+# 動画ファイル
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv
+*.flv
+*.webm
+
+# 音声ファイル
+*.mp3
+*.wav
+*.flac
+*.aac
+*.ogg
+
+# データセットファイル
+*.tar.gz
+*.zip
+*.rar
+*.7z
+
+# データファイル
+*.csv
+*.json
+*.xml
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# モデルファイル
+*.pth
+*.pt
+*.ckpt
+*.model
+*.weights
+*.h5
+
+# ログファイル
+*.log
+*.out
+*.err
+
+# 一時ファイル
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Python関連
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 仮想環境
+venv/
+env/
+ENV/
+.venv/
+.env/
+
+# IDE設定
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 実験結果とデータディレクトリ
+data/
+dataset/
+flwr-data/
+test-flwr-data/
+results/
+tmp/
+tmp1/
+tmp2/
+prd/
+stg/
+auto/
+averaging/
+Random_Result/
+Rondom/
+
+# 特定のディレクトリ
+CIFAR10/
+00_Production/
+
+# 設定ファイル（必要に応じて調整）
+*.ini
+*.cfg

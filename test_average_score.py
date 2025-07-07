@@ -6,9 +6,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, random_split, ConcatDataset
+from torch.utils.data import DataLoader, random_split, ConcatDataset, Subset
 from torchvision.datasets import CIFAR10
 
+from sklearn.model_selection import StratifiedShuffleSplit
+from collections import Counter
 import flwr as fl
 
 from flwr.common import (
@@ -40,11 +42,7 @@ from scipy import stats
 now = datetime.datetime.now()
 current_time = now.strftime("%Y-%m-%d-%H-%M")
 
-NUM_CLIENTS = 5 # クライアント数
-EPOCHS = 1 # エポック数
 
-SAVE_DIR = f"CIFAR10/node-{NUM_CLIENTS}/{current_time}"
-os.makedirs(SAVE_DIR, exist_ok=True)
 
 # Initialize lists to store parameter changes
 global_params_history = []
@@ -58,6 +56,7 @@ client_contoribution_history = []
 client_trainloader = []
 client_valloader = []
 epochs_history = []
+random_times_history = []
 BASE_TOKEN = 10
 DEVICE = torch.device("cpu")  # Try "cuda" to train on GPU
 print(
@@ -65,41 +64,150 @@ print(
 )
 
 
-def load_datasets(num_clients: int):
-    # Download and transform CIFAR-10 (train and test)
+def stratified_split_indices(dataset, train_size=0.8, random_state=42):
+    """
+    層化サンプリングを用いてデータセットを分割する関数。
+    Args:
+        dataset: データセット (torchvision.datasets)
+        train_size: トレーニングデータの割合
+        random_state: 乱数シード
+    Returns:
+        train_indices: トレーニングデータのインデックス
+        val_indices: 検証データのインデックス
+    """
+    labels = np.array([dataset[i][1] for i in range(len(dataset))])  # ラベルを取得
+    strat_split = StratifiedShuffleSplit(n_splits=1, train_size=train_size, random_state=random_state)
+    train_indices, val_indices = next(strat_split.split(np.zeros(len(labels)), labels))
+    return train_indices, val_indices
+
+def load_datasets_stratified(num_clients, client_data_sizes):
+    """
+    層化分割を用いてCIFAR-10をクライアントごとに分割し、train/valのデータローダを作成する関数。
+    Args:
+        num_clients: クライアント数
+        client_data_sizes: クライアントごとのデータサイズの割合リスト
+    Returns:
+        trainloaders: クライアントごとのトレーニングデータローダ
+        valloaders: クライアントごとの検証データローダ
+        testloader: テストデータローダ
+    """
+    # CIFAR-10データのダウンロードと前処理
     transform = transforms.Compose(
         [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
     )
     trainset = CIFAR10("./dataset", train=True, download=True, transform=transform)
     testset = CIFAR10("./dataset", train=False, download=True, transform=transform)
 
-    # Split training set into `num_clients` partitions to simulate different local datasets
-    partition_size = len(trainset) // num_clients
-    lengths = [partition_size] * num_clients
-    datasets = random_split(trainset, lengths, torch.Generator().manual_seed(42))
+    print(len(trainset), len(testset))
+    global NUM_CLIENTS
+    if sum(client_data_sizes) != 1.0 or len(client_data_sizes) != num_clients:
+        raise ValueError("Sum of client_data_sizes must be 1.0")
+    
+    client_data_split_sizes = [int(len(trainset) * size) for size in client_data_sizes]
+    if sum(client_data_split_sizes) != len(trainset):
+        raise ValueError("Sum of client_data_split_sizes must be equal to the length of trainset")
 
-    # Split each partition into train/val and create DataLoader
+    # クライアントごとのデータセット分割
+    client_data_split_sizes = [int(len(trainset) * size) for size in client_data_sizes]
+    print(client_data_split_sizes)
+    print(sum(client_data_split_sizes))
+    labels = np.array([trainset[i][1] for i in range(len(trainset))])
+
+    strat_split = StratifiedShuffleSplit(n_splits=1, random_state=42)
+    client_indices_list = []
+    remaining_indices = np.arange(len(trainset))
+
+    # 層化分割で各クライアントのデータセットを作成
+    for size in client_data_split_sizes:
+        if size < len(remaining_indices):
+            split = StratifiedShuffleSplit(n_splits=1, train_size=size, random_state=42)
+            train_indices, _ = next(split.split(remaining_indices, labels[remaining_indices]))
+        else:
+            train_indices = np.arange(len(remaining_indices))
+        print(len(train_indices))
+        client_indices_list.append(remaining_indices[train_indices])
+        remaining_indices = np.setdiff1d(remaining_indices, remaining_indices[train_indices])
+    print([len(client_indices) for client_indices in client_indices_list])
+
     trainloaders = []
     valloaders = []
-    for ds in datasets:
-        len_val = len(ds) // 10  # 10 % validation set
-        len_train = len(ds) - len_val
-        lengths = [len_train, len_val]
-        ds_train, ds_val = random_split(ds, lengths, torch.Generator().manual_seed(42))
+
+    # 各クライアントのデータをtrain/valに分割
+    for i, client_indices in enumerate(client_indices_list):
+        client_dataset = Subset(trainset, client_indices)
+        train_indices, val_indices = stratified_split_indices(client_dataset, train_size=0.9)
+        ds_train = Subset(client_dataset, train_indices)
+        ds_val = Subset(client_dataset, val_indices)
         trainloaders.append(DataLoader(ds_train, batch_size=32, shuffle=True))
         valloaders.append(DataLoader(ds_val, batch_size=32))
-        print(len(trainloaders), len(valloaders))
+
+
+        # クラスごとのサンプル数を表示
+        train_labels = [ds_train[i][1] for i in range(len(ds_train))]
+        val_labels = [ds_val[i][1] for i in range(len(ds_val))]
+        train_class_counts = Counter(train_labels)
+        val_class_counts = Counter(val_labels)
+
+        print(f"Client {i+1}:")
+        print(f"  Train Size = {len(ds_train)} | Class Counts: {dict(train_class_counts)}")
+        print(f"  Val Size   = {len(ds_val)}   | Class Counts: {dict(val_class_counts)}")
+
+
+    # テストデータローダ
     testloader = DataLoader(testset, batch_size=32)
-    # データの量を表示
+
+    # 結果の表示
     for i, (trainloader, valloader) in enumerate(zip(trainloaders, valloaders), 1):
         print(f"Client {i}: Train Size = {len(trainloader.dataset)}, Val Size = {len(valloader.dataset)}")
-        global client_trainloader, client_valloader
-        client_trainloader.append((len(trainloader.dataset),trainloader.dataset))
-        client_valloader.append((len(valloader.dataset),valloader.dataset))
     
     print(f"Total Test Size = {len(testloader.dataset)}")
-    print(f"Average Test Size per Client = {len(testloader.dataset) // num_clients}")
     return trainloaders, valloaders, testloader
+
+# def load_datasets(num_clients: int, client_data_sizes: list) -> Tuple[List[DataLoader], List[DataLoader], DataLoader]:
+#     # Download and transform CIFAR-10 (train and test)
+#     transform = transforms.Compose(
+#         [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
+#     )
+#     trainset = CIFAR10("./dataset", train=True, download=True, transform=transform)
+#     testset = CIFAR10("./dataset", train=False, download=True, transform=transform)
+#     print(len(trainset), len(testset))
+#     global NUM_CLIENTS
+#     if sum(client_data_sizes) != 1.0 or len(client_data_sizes) != num_clients:
+#         raise ValueError("Sum of client_data_sizes must be 1.0")
+    
+#     client_data_split_sizes = [int(len(trainset) * size) for size in client_data_sizes]
+#     if sum(client_data_split_sizes) != len(trainset):
+#         raise ValueError("Sum of client_data_split_sizes must be equal to the length of trainset")
+
+
+
+
+#     # Split training set into `num_clients` partitions to simulate different local datasets
+#     datasets = random_split(trainset, client_data_split_sizes, torch.Generator().manual_seed(42))
+
+#     # Split each partition into train/val and create DataLoader
+#     trainloaders = []
+#     valloaders = []
+#     for ds in datasets:
+#         len_val = len(ds)//10
+#         len_train = len(ds) - len_val
+#         lengths = [len_train, len_val]
+#         ds_train, ds_val = random_split(ds, lengths, torch.Generator().manual_seed(42))
+#         trainloaders.append(DataLoader(ds_train, batch_size=32, shuffle=True))
+#         valloaders.append(DataLoader(ds_val, batch_size=32))
+#         print(len(trainloaders), len(valloaders))
+#     testloader = DataLoader(testset, batch_size=32)
+    
+#     # データの量を表示
+#     for i, (trainloader, valloader) in enumerate(zip(trainloaders, valloaders), 1):
+#         print(f"Client {i}: Train Size = {len(trainloader.dataset)}, Val Size = {len(valloader.dataset)}")
+#         global client_trainloader, client_valloader
+#         client_trainloader.append((len(trainloader.dataset), trainloader.dataset))
+#         client_valloader.append((len(valloader.dataset), valloader.dataset))
+    
+#     print(f"Total Test Size = {len(testloader.dataset)}")
+#     print(f"Average Test Size per Client = {len(testloader.dataset) // num_clients}")
+#     return trainloaders, valloaders, testloader
 
 
 class Net(nn.Module):
@@ -143,10 +251,11 @@ def set_parameters(net, parameters: List[np.ndarray]):
     state_dict = OrderedDict({k: torch.Tensor(v) for k, v in params_dict})
     net.load_state_dict(state_dict, strict=True)
 
-def train(net, trainloader, epochs):
+def train(net, trainloader, epochs,learning_rate) -> None:
     """Train the network on the training set."""
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(net.parameters())
+    # optimizer = torch.optim.SGD(net.parameters(), lr=learning_rate)
     net.train()
     for epoch in range(epochs):
         correct, total, epoch_loss = 0, 0, 0.0
@@ -201,7 +310,7 @@ class FlowerClient(fl.client.NumPyClient):
         # Before training, save the initial local parameters
         local_params_before = get_parameters(self.net)
         print(f"[Client {self.cid}] epoch: {EPOCHS}")
-        train(self.net, self.trainloader, epochs=EPOCHS)  
+        train(self.net, self.trainloader, epochs=EPOCHS, learning_rate=config["lr"])  
         
 
         global_params_after = get_parameters(self.net)
@@ -318,10 +427,11 @@ class FedCustom(fl.server.strategy.Strategy):
 
         # Create custom configs
         # TODO: 学習率の設定は要検討(シミュレーションごとに任意に変更できると良い)
+        global LEARNING_RATE
         n_clients = len(clients)
         half_clients = n_clients // 2
-        standard_config = {"lr": 0.001}
-        higher_lr_config = {"lr": 0.001}
+        standard_config = {"lr": LEARNING_RATE}
+        higher_lr_config = {"lr": LEARNING_RATE}
         fit_configurations = []
         for idx, client in enumerate(clients):
             if idx < half_clients:
@@ -387,6 +497,7 @@ class FedCustom(fl.server.strategy.Strategy):
         global client_contoribution_history
         global epochs_history
         global EPOCHS
+        global random_times_history
         
 
         
@@ -403,7 +514,22 @@ class FedCustom(fl.server.strategy.Strategy):
         tmp_loss_global = []
         tmp_client_accuracy = []
         tmp_client_loss = []
-        for client_id, valloader in enumerate(self.valloaders):
+        rng = np.random.default_rng()
+        # random_times = rng.normal(loc=1, scale=0.5)
+        # random_times = rng.normal(loc=0, scale=0.5)
+        random_times = rng.normal(loc=0.6, scale=0.1)
+        random_times_history.append(random_times)
+
+
+        all_token = 0
+        client_all_token = [0 for _ in range(NUM_CLIENTS)]
+        if len(clinet_token_history) != 0:
+            for token in clinet_token_history:
+                all_token += sum(token)
+                for idx, t in enumerate(token):
+                    client_all_token[idx] += t
+
+        for client_id, valloader in enumerate(self.valloaders): #j
             tmp_accuracy = []
             tmp_loss = []
             tmp_accuracy_for_client = [0 for _ in range(NUM_CLIENTS)]
@@ -415,31 +541,46 @@ class FedCustom(fl.server.strategy.Strategy):
             tmp_loss_global.append(GLoss)
 
             print(f"Client {client_id} Global Model Accuracy: {GAccuracy:.4f}, Global Model Loss: {GLoss:.4f}")
-            for client_proxy, fit_res in results:
+            for client_proxy, fit_res in results:  #i
                 if int(client_proxy.cid) != int(client_id):
                     model = Net().to(DEVICE)
+                    # if int(client_proxy.cid) == NUM_CLIENTS:
+                    #     print(f"Client {client_id} -> Client {client_proxy.cid}  Random times: {random_times} (Random param)")
+                    #     randam_params = parameters_to_ndarrays(self.current_round_global_params)
+                    #     # randam_params = [param * random_times for param in randam_params]
+                    #     randam_params = [param + (param * random_times) for param in randam_params]
+                    #     set_parameters(model, randam_params)
+                    # else:
+                    #     set_parameters(model, parameters_to_ndarrays(fit_res.parameters))
+                    if all_token == 0:
+                        percent = 1/NUM_CLIENTS
+                    else:
+                        percent = client_all_token[int(client_id)] / all_token
                     set_parameters(model, parameters_to_ndarrays(fit_res.parameters))
                     loss, accuracy = evaluate_model_on_own_data(model, valloader)
                     tmp_loss_for_client[int(client_proxy.cid)] = loss
                     tmp_accuracy_for_client[int(client_proxy.cid)] = accuracy
                     if loss < GLoss:
                         # クライアントごとのLossとAccuracyを提出する
-                        clinet_accuracy[int(client_id)].append(accuracy)
-                        clinet_loss[int(client_id)].append(loss)
+                        
+                        clinet_accuracy[int(client_proxy.cid)].append(accuracy*percent)
+                        clinet_loss[int(client_proxy.cid)].append(loss*percent)
                         tmp_accuracy.append(accuracy)
                         tmp_loss.append(loss)
                         own_test_results.append((client_proxy.cid, loss, accuracy))
-                        print(f"Client {client_id} -> Client {client_proxy.cid}  Accuracy: {accuracy:.4f}, Loss: {loss:.4f}")
+                        print(f"Client {client_id} -> Client {client_proxy.cid}  Accuracy: {accuracy:.4f}, Loss: {loss:.4f}  (Submitted) , Token: {client_all_token[int(client_proxy.cid)]}, parcent: {percent:.4f}")
                     else:
-                        print(f"Client {client_id} -> Client {client_proxy.cid}  Accuracy: {accuracy:.4f}, Loss: {loss:.4f} (Not submitted)")
+                        print(f"Client {client_id} -> Client {client_proxy.cid}  Accuracy: {accuracy:.4f}, Loss: {loss:.4f} (Not submitted), Token: {client_all_token[int(client_proxy.cid)]}, parcent: {percent:.4f}")
+                        clinet_accuracy[int(client_proxy.cid)].append(0)
+                        clinet_loss[int(client_proxy.cid)].append(0)
                         tmp_accuracy.append(None)
                         tmp_loss.append(None)
                 else:
                     model = Net().to(DEVICE)
                     set_parameters(model, parameters_to_ndarrays(fit_res.parameters))
                     loss, accuracy = evaluate_model_on_own_data(model, valloader)
-                    tmp_accuracy_for_client[int(client_id)] = accuracy
-                    tmp_loss_for_client[int(client_id)] = loss
+                    tmp_accuracy_for_client[int(client_proxy.cid)] = accuracy
+                    tmp_loss_for_client[int(client_proxy.cid)] = loss
             #ここにクライアントが評価した他のクライアントの値を保存
             tmp_client_accuracy.append(tmp_accuracy_for_client)
             tmp_client_loss.append(tmp_loss_for_client)
@@ -467,36 +608,54 @@ class FedCustom(fl.server.strategy.Strategy):
         # クライアントが評価したLossとAccuracyを平均化する
         accuracy_list = []
         loss_list = []
+        
+
+
+
         for client_id in range(NUM_CLIENTS):
             # clinet_accuracyとclinet_lossの信頼区間を計算
             accuracies = np.array(clinet_accuracy[client_id])
             losses = np.array(clinet_loss[client_id])
             
-            if len(accuracies) > 1:
-                accuracy_mean = np.mean(accuracies)
-                accuracy_se = stats.sem(accuracies)
-                accuracy_ci = stats.t.interval(0.95, len(accuracies)-1, loc=accuracy_mean, scale=accuracy_se)
-                loss_mean = np.mean(losses)
-                loss_se = stats.sem(losses)
-                loss_ci = stats.t.interval(0.95, len(losses)-1, loc=loss_mean, scale=loss_se)
-                
-                # 信頼区間内の値をフィルタリングして平均化
-                accuracy_within_ci = accuracies[(accuracies >= accuracy_ci[0]) & (accuracies <= accuracy_ci[1])]
-                if len(accuracy_within_ci) > 0:
-                    accuracy_list.append(np.mean(accuracy_within_ci))
-                else:
-                    accuracy_list.append(accuracy_mean)
 
-                # 信頼区間内の値をフィルタリングして平均化
-                loss_within_ci = losses[(losses >= loss_ci[0]) & (losses <= loss_ci[1])]
-                if len(loss_within_ci) > 0:
-                    loss_list.append(np.mean(loss_within_ci))
-                else:
-                    loss_list.append(loss_mean)
+            #TODO: 2つ以上の評価がある場合のみを対象とする
+            # if len(accuracies) > 1:
+            if len(accuracies) > NUM_CLIENTS//2:
+            
+                # accuracy_mean = np.mean(accuracies)
                 
-            elif len(accuracies) == 1:
-                accuracy_list.append(np.mean(accuracies))
-                loss_list.append(np.mean(losses))
+                # accuracy_se = stats.sem(accuracies)
+                # accuracy_ci = stats.t.interval(0.95, len(accuracies)-1, loc=accuracy_mean, scale=accuracy_se)
+                # loss_mean = np.mean(losses)
+                # loss_se = stats.sem(losses)
+                # loss_ci = stats.t.interval(0.95, len(losses)-1, loc=loss_mean, scale=loss_se)
+                
+                # # 信頼区間内の値をフィルタリングして平均化
+                # accuracy_within_ci = accuracies[(accuracies >= accuracy_ci[0]) & (accuracies <= accuracy_ci[1])]
+                # if len(accuracy_within_ci) > 0:
+                #     accuracy_list.append(np.mean(accuracy_within_ci))
+                # else:
+                #     accuracy_list.append(accuracy_mean)
+
+                # # 信頼区間内の値をフィルタリングして平均化
+                # loss_within_ci = losses[(losses >= loss_ci[0]) & (losses <= loss_ci[1])]
+                # if len(loss_within_ci) > 0:
+                #     loss_list.append(np.mean(loss_within_ci))
+                # else:
+                #     loss_list.append(loss_mean)
+
+                
+                # print(f"Client {client_id} Accuracy: {accuracy_mean:.4f}, Loss: {loss_mean:.4f}")
+
+                accuracy_sum = sum(accuracies)
+                loss_sum = sum(losses)
+                accuracy_list.append(accuracy_sum)
+                loss_list.append(loss_sum)
+                print(f"Client {client_id} Accuracy: {accuracy_sum:.4f}, Loss: {loss_sum:.4f}")
+                
+            # elif len(accuracies) == 1:
+            #     accuracy_list.append(np.mean(accuracies))
+            #     loss_list.append(np.mean(losses))
             else:
                 accuracy_list.append(None)
                 loss_list.append(None)
@@ -518,16 +677,21 @@ class FedCustom(fl.server.strategy.Strategy):
         total_weight = sum(weights)
 
         #TODO:Noneが多い場合の処理を考える
-        # if total_weight > 0:
-        if total_weight > 0 and none_count < NUM_CLIENTS//2+1:
-            print(f"Next Round Epochs: {EPOCHS}")
-            # if none_count > NUM_CLIENTS//2+1:
-            #     print(f"None count :{none_count}")
-            #     if EPOCHS < 20:
-            #         EPOCHS += 1
-            #     print(f"Next Round Epochs: {EPOCHS}")
+        if total_weight > 0:
+            if none_count > NUM_CLIENTS//2+1:
+                print(f"None count :{none_count}")
+                if EPOCHS < 20:
+                    EPOCHS += 1
+                print(f"Next Round Epochs: {EPOCHS}")
+        
+        # if total_weight > 0  and none_count < NUM_CLIENTS//2+1:
+        #     print(f"None count :{none_count}(Normal)")
+        #     print(f"Next Round Epochs: {EPOCHS}")
+       
 
             normalized_weights = [weight / total_weight if weight > 0 else 0 for weight in weights]
+            for idx, weight in enumerate(normalized_weights):
+                print(f"Client {idx + 1} Weight: {weight:.4f}")
             # Calculate and store client contributions
             for client_proxy, _ in results:
                 client_id = int(client_proxy.cid)
@@ -566,11 +730,94 @@ class FedCustom(fl.server.strategy.Strategy):
             # Tokenの更新
             client_token = [0 for _ in range(NUM_CLIENTS)]
             for idx, weight in enumerate(normalized_weights):
-                client_token[idx] += BASE_TOKEN * weight
+                client_token[idx] += min(BASE_TOKEN * weight, BASE_TOKEN/2)
+                print(f"Client {idx + 1} Token: {client_token[idx]}", end=" ")
+            print()
             clinet_token_history.append(client_token)
+
+        # elif total_weight >0 and  none_count >= NUM_CLIENTS//2+1:
+        #     # epoch数をスケーリング
+        #     if EPOCHS < 20:
+        #         EPOCHS += 1
+        #     print(f"Next Round Epochs: {EPOCHS}")
+        #     print(f"None count :{none_count}(Check client's loss)")
+        #     select_client_weight = []
+        #     for idx in range(NUM_CLIENTS):
+        #         if len(clinet_loss[idx]) == NUM_CLIENTS-1:
+        #             select_client_weight.append(weights[idx])
+        #         else:
+        #             select_client_weight.append(0)
+        #     total_select_weight = sum(select_client_weight)
+        #     if total_select_weight > 0:
+        #         print(f"None count :{none_count}(approved all other clients)")
+        #         normalized_weights = [weight / total_select_weight if weight > 0 else 0 for weight in select_client_weight]
+        #         for idx, weight in enumerate(normalized_weights):
+        #             print(f"Client {idx + 1} Weight: {weight:.4f}")
+        #         # Calculate and store client contributions
+        #         for client_proxy, _ in results:
+        #             client_id = int(client_proxy.cid)
+        #             if client_id not in self.client_contribution_scores:
+        #                 self.client_contribution_scores[client_id] = []
+        #             self.client_contribution_scores[client_id].append(normalized_weights[client_id - 1])
+        #         client_contoribution_history.append(normalized_weights)
+        #         # クライアントのパラメータを取得
+        #         client_parameters = [parameters_to_ndarrays(fit_res.parameters) for _, fit_res in results]
+
+        #         # グローバルパラメータを重み付け平均化
+        #         # for params in zip(*client_parameters):
+        #             # weighted_params = [weight * param for weight, param in zip(normalized_weights, params)]
+        #             # Extract parameters and client contributions
+        #         weights_results = [(params,weight) for weight, params in zip(normalized_weights, client_parameters)]
+        #         aggregated_params = aggregate(weights_results)
+        #         # Save the aggregated global parameters
+        #         parameters_aggregated = ndarrays_to_parameters(aggregated_params)
+        #         global_params_history.append(parameters_aggregated)
+
+        #         # Update the current round global parameters
+        #         self.current_round_global_params = parameters_aggregated
+
+        #         # グローバルモデルに新しいパラメータを設定
+        #         net = Net().to(DEVICE)
+        #         set_parameters(net, aggregated_params)
+        #         global_loss, global_accuracy = test(net, testloader)
+        #         self.global_loss_history.append(global_loss)
+        #         self.global_accuracy_history.append(global_accuracy)
+
+        #         # Print evaluation results
+        #         print(
+        #             f"Round {server_round}: Global Accuracy = {global_accuracy:.4f}, Global Loss = {global_loss:.4f}"
+        #         )
+
+        #         # Tokenの更新
+        #         client_token = [0 for _ in range(NUM_CLIENTS)]
+        #         for idx, weight in enumerate(normalized_weights):
+        #             client_token[idx] += BASE_TOKEN * weight
+        #             print(f"Client {idx + 1} Token: {client_token[idx]}", end=" ")
+        #         print()
+        #         clinet_token_history.append(client_token)
+        #     else:
+        #         print(f"None count :{none_count}(Not approved all other clients)")
+        #         clinet_token_history.append([0 for _ in range(NUM_CLIENTS)])
+        #         for idx, token in enumerate([0 for _ in range(NUM_CLIENTS)]):
+        #             print(f"Client {idx + 1} Token: {token}", end=" ")
+        #         print()
+        #         client_contoribution_history.append([0 for _ in range(NUM_CLIENTS)])
+        #         global_loss, global_accuracy = test(net, testloader)
+        #         self.global_loss_history.append(global_loss)
+        #         self.global_accuracy_history.append(global_accuracy)
+        #         # Print evaluation results
+        #         print(
+        #             f"Round {server_round}: Global Accuracy = {global_accuracy:.4f}, Global Loss = {global_loss:.4f}"
+        #         )
+                
+        #         parameters_aggregated = self.current_round_global_params
+            
         else:
             print(f"None count :{none_count}")
             clinet_token_history.append([0 for _ in range(NUM_CLIENTS)])
+            for idx, token in enumerate([0 for _ in range(NUM_CLIENTS)]):
+                print(f"Client {idx + 1} Token: {token}", end=" ")
+            print()
             client_contoribution_history.append([0 for _ in range(NUM_CLIENTS)])
             global_loss, global_accuracy = test(net, testloader)
             self.global_loss_history.append(global_loss)
@@ -585,7 +832,13 @@ class FedCustom(fl.server.strategy.Strategy):
             print(f"Next Round Epochs: {EPOCHS}")
             
             parameters_aggregated = self.current_round_global_params
+        
 
+        for client_id in range(NUM_CLIENTS):
+            total_token = 0
+            for token in clinet_token_history:
+                total_token += token[client_id]
+            print(f"[Round {server_round}] Client {client_id + 1} Total Token: {total_token}")
         return parameters_aggregated, {}
     
     def evaluate(
@@ -730,6 +983,7 @@ class FedCustom(fl.server.strategy.Strategy):
             for client_id in range(num_clients):
                 accuracies = [self.client_accuracy_history_by_client[round_idx][client_idx][client_id] for round_idx in range(num_rounds)]
                 plt.scatter(range(num_rounds), accuracies, label=f'Accuracy: Client {client_id + 1}',color=colors[client_id])
+                # plt.scatter(range(num_rounds), accuracies, label=f'Accuracy: Client {client_id + 1}')
         plt.xlabel('Round')
         plt.ylabel('Accuracy')
         plt.title('Client Accuracy Over Rounds')
@@ -745,6 +999,7 @@ class FedCustom(fl.server.strategy.Strategy):
             for client_id in range(num_clients):
                 losses = [self.client_loss_history_by_client[round_idx][client_idx][client_id] for round_idx in range(num_rounds)]
                 plt.scatter(range(num_rounds), losses,label=f'Loss": Client {client_id + 1}',color=colors[client_id])
+                # plt.scatter(range(num_rounds), losses,label=f'Loss": Client {client_id + 1}')
         plt.xlabel('Round')
         plt.ylabel('Loss')
         plt.title('Client Loss Over Rounds')
@@ -789,7 +1044,7 @@ class FedCustom(fl.server.strategy.Strategy):
         plt.figure(figsize=(12, 6))
         for client_id in range(NUM_CLIENTS):
             rounds_tokens = [token[client_id] for token in clinet_token_history]
-            plt.scatter(range(num_rounds), rounds_tokens, label=f'Client {client_id + 1}')
+            plt.plot(range(num_rounds), rounds_tokens, label=f'Client {client_id + 1}', marker='o')
         plt.xlabel('Round')
         plt.ylabel('Token')
         plt.title('Client Token History Over Rounds')
@@ -931,26 +1186,34 @@ class FedCustom(fl.server.strategy.Strategy):
             writer.writerow(["Round", "Epochs"])
             for round_num, epochs in enumerate(epochs_history):
                 writer.writerow([round_num, epochs])
-
+        
+        # Save random_times_history
+        with open(os.path.join(SAVE_DIR, "random_times_history.csv"), mode="w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(["Round", "Random Times"])
+            for round_num, random_times in enumerate(random_times_history):
+                writer.writerow([round_num, random_times])
 
 def train_single_client(trainloader, valloader, testloader, epochs:List[int],rounds:int):
     # モデルの定義
     train_size = len(trainloader.dataset)
-    val_size = len(valloader.dataset)
-    test_size = len(testloader.dataset)
     model = Net()
     model_param = get_parameters(model)
     list_loss = []
     list_accuracy = []
     list_loss_test = [] 
     list_accuracy_test = []
+    global LEARNING_RATE
     for round_num in range(rounds):
         print(f"Round {round_num}: Training, Epochs = {epochs[round_num]}")
         set_parameters(model, model_param)
-        train(model, trainloader, epochs=epochs[round_num])
+        train(model, trainloader, epochs=epochs[round_num],learning_rate=LEARNING_RATE)
         loss, accuracy = test(model, valloader)
         loss_test, accuracy_test = test(model, testloader)
-        model_param = get_parameters(model)
+        if len(list_loss) > 1 and  loss < list_loss[len(list_loss)-1]:
+            print(f"Update Model Parameter")
+            model_param = get_parameters(model)
+        # model_param_1 = get_parameters(model)
         print(f"Round {round_num}: Loss = {loss:.4f}, Accuracy = {accuracy:.4f}")
         print(f"Round {round_num}: Loss(Test) = {loss_test:.4f}, Accuracy(Test) = {accuracy_test:.4f}")
         list_loss.append(loss)
@@ -968,10 +1231,13 @@ def train_single_client(trainloader, valloader, testloader, epochs:List[int],rou
     for round_num in range(rounds):
         print(f"Round {round_num}: Training, Epochs = {1}")
         set_parameters(model_1, model_param_1)
-        train(model_1, trainloader, epochs=1)
+        train(model_1, trainloader, epochs=1,learning_rate=LEARNING_RATE)
         loss_1, accuracy_1 = test(model_1, valloader)
         loss_test_1, accuracy_test_1 = test(model_1, testloader)
-        model_param_1 = get_parameters(model_1)
+        if len(list_loss_1) > 1 and loss_1 < list_loss_1[len(list_loss_1)-1]:
+            print(f"Update Model Parameter")
+            model_param_1 = get_parameters(model_1)
+        # model_param_1 = get_parameters(model_1)
         print(f"Round {round_num}: Loss = {loss_1:.4f}, Accuracy = {accuracy_1:.4f}")
         print(f"Round {round_num}: Loss(Test) = {loss_test_1:.4f}, Accuracy(Test) = {accuracy_test_1:.4f}")
         list_loss_1.append(loss_1)
@@ -1106,96 +1372,149 @@ def train_single_client(trainloader, valloader, testloader, epochs:List[int],rou
     plt.grid()
     plt.savefig(os.path.join(SAVE_DIR, f"single_model_epoch_1_accuracy_vs_global_accuracy_train-size_{train_size}.png"))
 
-ROUND_NUM = 3
-
-trainloaders, valloaders, testloader = load_datasets(NUM_CLIENTS)
-
-# Specify client resources if you need GPU (defaults to 1 CPU and 0 GPU)
-client_resources = None
-if DEVICE.type == "cuda":
-    client_resources = {"num_gpus": 1}
-
-
-# Flower simulation configuration
-#strategy = EnhancedFedCustom()
-strategy = FedCustom()
-
-fl.simulation.start_simulation(
-    client_fn=client_fn,
-    num_clients=NUM_CLIENTS,
-    config=fl.server.ServerConfig(ROUND_NUM),
-    strategy=strategy,
-    client_resources=client_resources,
-)
-
-# Post-simulation plotting and saving
-strategy.plot_global_metrics()
-strategy.save_contribution_scores()
-strategy.plot_client_performance(clinet_accuracy_history, clinet_loss_history)
-strategy.plot_client_histories(clinet_token_history, client_contoribution_history)
-strategy.save_histories_to_csv()
-
-trainloader = trainloaders[0]
-valloader = valloaders[0]
-train_single_client(trainloader, valloader, testloader, epochs_history,ROUND_NUM)
-combined_train_dataset = ConcatDataset([loader.dataset for loader in trainloaders])
-combined_val_dataset = ConcatDataset([loader.dataset for loader in valloaders])
-combined_trainloader = DataLoader(combined_train_dataset, batch_size=32, shuffle=True)
-combined_valloader = DataLoader(combined_val_dataset, batch_size=32)
-print(f"Combined Train Size = {len(combined_trainloader.dataset)}, Combined Val Size = {len(combined_valloader.dataset)}")
-train_single_client(combined_trainloader, combined_valloader, testloader, epochs_history,ROUND_NUM)
+def plot_single_and_global_metrics(min_data_size:int, max_data_size:int) -> None:
+    with open(os.path.join(SAVE_DIR, "global_accuracy_history.csv"), mode="r") as file:
+        reader = csv.reader(file)
+        header = next(reader)
+        list_accuracy_global = [float(row[1]) for row in reader]
+    with open(os.path.join(SAVE_DIR, "global_loss_history.csv"), mode="r") as file:
+        reader = csv.reader(file)
+        header = next(reader)
+        list_loss_global = [float(row[1]) for row in reader]
+    with open(os.path.join(SAVE_DIR, f"single_model_epoch_1_metrics_train-size_{min_data_size}.csv"), mode="r") as file:
+        reader = csv.reader(file)
+        header = next(reader)
+        rows = list(reader) 
+        list_accuracy_single_9000 = [float(row[2]) for row in rows]
+        list_loss_single_9000 = [float(row[1]) for row in rows]
+        list_accuracy_single_9000_test = [float(row[4]) for row in rows]
+        list_loss_single_9000_test = [float(row[3]) for row in rows]
+    with open(os.path.join(SAVE_DIR, f"single_model_epoch_1_metrics_train-size_{max_data_size}.csv"), mode="r") as file:
+        reader = csv.reader(file)
+        header = next(reader)
+        rows = list(reader) 
+        list_accuracy_single_450000 = [float(row[2]) for row in rows]
+        list_loss_single_450000 = [float(row[1]) for row in rows]
+        list_accuracy_single_450000_test = [float(row[4]) for row in rows]
+        list_loss_single_450000_test = [float(row[3]) for row in rows]
 
 
+    
+    # plt.rcParams['font.family'] = 'DejaVu Sans' # font familyの設定
+    # plt.rcParams['mathtext.fontset'] = 'stix' # math fontの設定
+    # plt.rcParams["font.size"] = 15 # 全体のフォントサイズが変更されます。
+    # plt.rcParams['xtick.labelsize'] = 9 # 軸だけ変更されます。
+    # plt.rcParams['ytick.labelsize'] = 24 # 軸だけ変更されます
+    # plt.rcParams['xtick.direction'] = 'in' # x axis in
+    # plt.rcParams['ytick.direction'] = 'in' # y axis in 
+    # plt.rcParams['axes.linewidth'] = 1.0 # axis line width
+    # plt.rcParams['axes.grid'] = True # make grid
+    # plt.rcParams["legend.fancybox"] = False # 丸角
+    # plt.rcParams["legend.framealpha"] = 1 # 透明度の指定、0で塗りつぶしなし
+    # plt.rcParams["legend.edgecolor"] = 'black' # edgeの色を変更
+    # plt.rcParams["legend.handlelength"] = 1 # 凡例の線の長さを調節
+    # plt.rcParams["legend.labelspacing"] = 5. # 垂直方向の距離の各凡例の距離
+    # plt.rcParams["legend.handletextpad"] = 3. # 凡例の線と文字の距離の長さ
+    # plt.rcParams["legend.markerscale"] = 2 # 点がある場合のmarker scale
+    # plt.rcParams["legend.borderaxespad"] = 0. # 凡例の端とグラフの端を合わせる
+    # plt.rcParams['figure.dpi'] = 300 # dpiの設定
 
-with open(os.path.join(SAVE_DIR, "global_accuracy_history.csv"), mode="r") as file:
-    reader = csv.reader(file)
-    header = next(reader)
-    list_accuracy_global = [float(row[1]) for row in reader]
-with open(os.path.join(SAVE_DIR, "global_loss_history.csv"), mode="r") as file:
-    reader = csv.reader(file)
-    header = next(reader)
-    list_loss_global = [float(row[1]) for row in reader]
-with open(os.path.join(SAVE_DIR, "single_model_epoch_1_metrics_train-size_9000.csv"), mode="r") as file:
-    reader = csv.reader(file)
-    header = next(reader)
-    rows = list(reader) 
-    list_accuracy_single_9000 = [float(row[2]) for row in rows]
-    list_loss_single_9000 = [float(row[1]) for row in rows]
-    list_accuracy_single_9000_test = [float(row[4]) for row in rows]
-    list_loss_single_9000_test = [float(row[3]) for row in rows]
-with open(os.path.join(SAVE_DIR, "single_model_epoch_1_metrics_train-size_45000.csv"), mode="r") as file:
-    reader = csv.reader(file)
-    header = next(reader)
-    rows = list(reader) 
-    list_accuracy_single_450000 = [float(row[2]) for row in rows]
-    list_loss_single_450000 = [float(row[1]) for row in rows]
-    list_accuracy_single_450000_test = [float(row[4]) for row in rows]
-    list_loss_single_450000_test = [float(row[3]) for row in rows]
+    plt.figure( figsize=(12, 6))
+    plt.scatter(range(ROUND_NUM), list_loss_global, label="Global Loss", color='green', marker='x')
+    plt.scatter(range(ROUND_NUM), list_loss_single_9000, label=f"Single Model Loss(Train Size:{min_data_size})", color='blue', marker='o')
+    plt.scatter(range(ROUND_NUM), list_loss_single_9000_test, label=f"Single Model Loss(Test, Train Size:{min_data_size})", color='purple', marker='o')
+    plt.scatter(range(ROUND_NUM), list_loss_single_450000, label=f"Single Model Loss(Train Size:{max_data_size})", color='blue', marker='^')
+    plt.scatter(range(ROUND_NUM), list_loss_single_450000_test, label=f"Single Model Loss(Test, Train Size:{max_data_size})", color='purple', marker='^')
+    plt.xlabel(r"$Round$")
+    plt.ylabel(r"$Loss$")
+    plt.title(f'Global Loss vs Single Model({min_data_size}{max_data_size}) Loss Over Rounds')
+    #plt.legend(ncol=2, bbox_to_anchor=(0., 1.025, 1., 0.102), loc=3)
+    plt.legend()
+    plt.grid()
+    plt.savefig(os.path.join(SAVE_DIR, f"global_loss_vs_single_model_{min_data_size}_{max_data_size}_loss.png"), bbox_inches="tight", pad_inches=0.05)
+    plt.close()
 
-plt.figure(figsize=(12, 6))
-plt.scatter(range(ROUND_NUM), list_loss_global, label="Global Loss", color='green', marker='x')
-plt.scatter(range(ROUND_NUM), list_loss_single_9000, label="Single Model Loss(Train Size:9000)", color='blue', marker='o')
-plt.scatter(range(ROUND_NUM), list_loss_single_9000_test, label="Single Model Loss(Test, Train Size:9000)", color='purple', marker='o')
-plt.scatter(range(ROUND_NUM), list_loss_single_450000, label="Single Model Loss(Train Size:450000)", color='blue', marker='^')
-plt.scatter(range(ROUND_NUM), list_loss_single_450000_test, label="Single Model Loss(Test, Train Size:45000)", color='purple', marker='^')
-plt.xlabel('Round')
-plt.ylabel('Loss')
-plt.title('Global Loss vs Single Model(9000,45000) Loss Over Rounds')
-plt.legend()
-plt.grid()
-plt.savefig(os.path.join(SAVE_DIR, "global_loss_vs_single_model_9000_45000_loss.png"))
-plt.close()
+    plt.figure( figsize=(12, 6))
+    plt.scatter(range(ROUND_NUM), list_accuracy_global, label="Global Accuracy", color='brown', marker='x')
+    plt.scatter(range(ROUND_NUM), list_accuracy_single_9000, label=f"Single Model Accuracy(Train Size:{min_data_size})", color='red', marker='o')
+    plt.scatter(range(ROUND_NUM), list_accuracy_single_9000_test, label=f"Single Model Accuracy(Test, Train Size:{min_data_size})", color='orange', marker='o')
+    plt.scatter(range(ROUND_NUM), list_accuracy_single_450000, label=f"Single Model Accuracy(Train Size:{max_data_size})", color='red', marker='^')
+    plt.scatter(range(ROUND_NUM), list_accuracy_single_450000_test, label=f"Single Model Accuracy(Test, Train Size:{max_data_size})", color='orange', marker='^')
+    plt.xlabel(r"$Round$")
+    plt.ylabel(r"$Accuracy$")
+    plt.title(f'Global Accuracy vs Single Model({min_data_size},{max_data_size}) Accuracy Over Rounds')
+    plt.legend()
+    # plt.legend(ncol=2, bbox_to_anchor=(0., 1.025, 1., 0.102), loc=3)
+    plt.grid()
+    plt.savefig(os.path.join(SAVE_DIR, f"global_accuracy_vs_single_model_{min_data_size}_{max_data_size}_accuracy.png"), bbox_inches="tight", pad_inches=0.05)
+    plt.close()
 
-plt.figure(figsize=(12, 6))
-plt.scatter(range(ROUND_NUM), list_accuracy_global, label="Global Accuracy", color='brown', marker='x')
-plt.scatter(range(ROUND_NUM), list_accuracy_single_9000, label="Single Model Accuracy(Train Size:9000)", color='red', marker='o')
-plt.scatter(range(ROUND_NUM), list_accuracy_single_9000_test, label="Single Model Accuracy(Test, Train Size:9000)", color='orange', marker='o')
-plt.scatter(range(ROUND_NUM), list_accuracy_single_450000, label="Single Model Accuracy(Train Size:450000)", color='red', marker='^')
-plt.scatter(range(ROUND_NUM), list_accuracy_single_450000_test, label="Single Model Accuracy(Test, Train Size:450000)", color='orange', marker='^')
-plt.xlabel('Round')
-plt.ylabel('Accuracy')
-plt.title('Global Accuracy vs Single Model(9000,45000) Accuracy Over Rounds')
-plt.legend()
-plt.grid()
-plt.savefig(os.path.join(SAVE_DIR, "global_accuracy_vs_single_model_9000_45000_accuracy.png"))
-plt.close()
+if __name__ == "__main__":
+    NUM_CLIENTS = 5 # クライアント数
+    # NUM_CLIENTS = 10 # クライアント数
+    EPOCHS = 1 # 初期のエポック数
+    LEARNING_RATE = 0.01 # 学習率
+    # Define a directory to save the plots
+    now = datetime.datetime.now()
+    current_time = now.strftime("%Y-%m-%d-%H-%M")
+    SAVE_DIR = f"averaging/CIFAR10/node-{NUM_CLIENTS}/{current_time}"
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    ROUND_NUM = 20 # ラウンド数
+    # CLIENT_DATA_SIZE = [0.1, 0.1, 0.2, 0.2, 0.4]
+    # CLIENT_DATA_SIZE = [0.05, 0.05, 0.2, 0.2, 0.5]
+    # CLIENT_DATA_SIZE = [0.001, 0.001, 0.198, 0.4, 0.4]
+    CLIENT_DATA_SIZE = [0.002, 0.002, 0.002, 0.497, 0.497]
+    # CLIENT_DATA_SIZE = [1/NUM_CLIENTS for _ in range(NUM_CLIENTS)]
+    # CLIENT_DATA_SIZE = [0.05, 0.05, 0.05, 0.05, 0.05, 0.15, 0.15, 0.15, 0.15, 0.15]
+    # CLIENT_DATA_SIZE = [0.001, 0.2475, 0.2475, 0.2475, 0.2565]
+    # データセットのロード
+
+    # trainloaders, valloaders, testloader = load_datasets(NUM_CLIENTS, CLIENT_DATA_SIZE)
+    trainloaders, valloaders, testloader = load_datasets_stratified(NUM_CLIENTS, CLIENT_DATA_SIZE)
+    for idx, trainloader in enumerate(trainloaders):
+        print(f"Client {idx + 1}: Train Size = {len(trainloader.dataset)}, Val Size = {len(valloaders[idx].dataset)}")
+    
+    trainloader = trainloaders[0]
+    valloader = valloaders[0]
+    testdata = testloader
+    print(f"Train Size = {len(trainloader.dataset)}, Val Size = {len(valloader.dataset)}, Test Size = {len(testdata.dataset)}")
+
+    # Specify client resources if you need GPU (defaults to 1 CPU and 0 GPU)
+    client_resources = None
+    if DEVICE.type == "cuda":
+        client_resources = {"num_gpus": 1}
+
+
+    # Flower simulation configuration
+    #strategy = EnhancedFedCustom()
+    strategy = FedCustom()
+
+    fl.simulation.start_simulation(
+        client_fn=client_fn,
+        num_clients=NUM_CLIENTS,
+        config=fl.server.ServerConfig(ROUND_NUM),
+        strategy=strategy,
+        client_resources=client_resources,
+    )
+
+    # Post-simulation plotting and saving
+    strategy.plot_global_metrics()
+    strategy.save_contribution_scores()
+    strategy.plot_client_performance(clinet_accuracy_history, clinet_loss_history)
+    strategy.plot_client_histories(clinet_token_history, client_contoribution_history)
+    strategy.save_histories_to_csv()
+
+    train_single_client(trainloader, valloader, testdata, epochs_history,ROUND_NUM)
+    combined_train_dataset = ConcatDataset([loader.dataset for loader in trainloaders])
+    combined_val_dataset = ConcatDataset([loader.dataset for loader in valloaders])
+    combined_trainloader = DataLoader(combined_train_dataset, batch_size=32, shuffle=True)
+    combined_valloader = DataLoader(combined_val_dataset, batch_size=32)
+    print(f"Combined Train Size = {len(combined_trainloader.dataset)}, Combined Val Size = {len(combined_valloader.dataset)}")
+    train_single_client(combined_trainloader, combined_valloader, testdata, epochs_history,ROUND_NUM)
+    min_data_size = len(trainloaders[0].dataset)
+    max_data_size = len(combined_trainloader.dataset)
+    plot_single_and_global_metrics(min_data_size, max_data_size)
+
+
+
+    
