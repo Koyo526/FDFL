@@ -67,7 +67,6 @@ Thumbs.db
 
 # Python関連
 __pycache__/
-*.py[cod]
 *$py.class
 *.so
 .Python
@@ -119,7 +118,6 @@ Rondom/
 
 # 特定のディレクトリ
 CIFAR10/
-00_Production/
 
 # 設定ファイル（必要に応じて調整）
 *.ini
